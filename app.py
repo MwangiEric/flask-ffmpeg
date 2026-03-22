@@ -1,82 +1,119 @@
 import os
 import io
-import uuid
+import json
+import base64
+import requests
 from flask import Flask, request, send_file, jsonify
-from rembg import remove, new_session
-from PIL import Image, ImageOps
-from colorthief import ColorThief
+
+# Core Engines
+from PIL import Image, ImageDraw, ImageFont
+from fpdf import FPDF
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from moviepy.editor import ImageClip, AudioFileClip
 
 app = Flask(__name__)
 
-# Initialize the session once for the worker
-# This downloads the u2net model to /home/user/.u2net on the first run
-# Tip: Ensure Leapcell has enough disk space for the ~170MB model
-try:
-    session = new_session()
-except Exception as e:
-    print(f"Model initialization warning: {e}")
-    session = None
+# Paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_PATH = os.path.join(BASE_DIR, 'tk_port.json')
+POPPINS_PATH = os.path.join(BASE_DIR, 'assets', 'poppins.ttf')
 
-def rgb_to_hex(rgb):
-    return '#%02x%02x%02x' % rgb
+def get_font_path():
+    return POPPINS_PATH if os.path.exists(POPPINS_PATH) else None
 
-@app.route('/process-image', methods=['POST'])
-def process_image():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+def get_json_template():
+    with open(TEMPLATE_PATH, 'r') as f:
+        return json.load(f)
+
+# --- PDF GENERATION (FPDF) ---
+def generate_pdf(user_data, template):
+    pdf = FPDF(orientation='P', unit='pt', format=(1080, 1920))
+    pdf.add_page()
     
-    file = request.files['file']
-    # Default to 800px for catalog consistency
-    target_size = int(request.form.get('size', 800))
+    # Draw Background (temporary file needed for FPDF)
+    bg_data = template['background']['base64'].split("base64,")[1]
+    bg_path = "/tmp/bg_temp.png"
+    with open(bg_path, "wb") as f:
+        f.write(base64.b64decode(bg_data))
+    pdf.image(bg_path, x=0, y=0, w=1080, h=1920)
+
+    # Add Poppins if available
+    font_p = get_font_path()
+    if font_p:
+        pdf.add_font('Poppins', '', font_p, uni=True)
+        pdf.set_font('Poppins', '', 40)
+    else:
+        pdf.set_font("Arial", size=40)
+
+    for el in template['elements']:
+        val = str(user_data.get(el['name'].strip("{}"), el.get('placeholderText', '')))
+        if el['type'] == 'text':
+            pdf.text(el['x'], el['y'] + int(el['fontSize']), val)
+            
+    buf = io.BytesIO()
+    pdf.output(dest='S').encode('latin-1') # Return as string buffer
+    return pdf.output(dest='S')
+
+# --- PPTX GENERATION (python-pptx) ---
+def generate_pptx(user_data, template):
+    prs = Presentation()
+    # Set slide size to 1080x1920 (in pixels to inches conversion)
+    prs.slide_width = Inches(11.25) 
+    prs.slide_height = Inches(20)
     
-    try:
-        input_data = file.read()
-        
-        # 1. Background Removal
-        # session=session reuses the loaded model for speed
-        no_bg_bytes = remove(input_data, session=session, alpha_matting=True)
-        
-        # 2. Image Processing (Pillow)
-        subject_img = Image.open(io.BytesIO(no_bg_bytes)).convert("RGBA")
-        
-        # Maintain aspect ratio & center on transparent 800x800 canvas
-        # This keeps Avechi/Kenyatronics listings looking uniform
-        final_img = ImageOps.pad(subject_img, (target_size, target_size), color=(0, 0, 0, 0))
-        
-        # 3. Color Extraction (ColorThief)
-        img_byte_arr = io.BytesIO()
-        final_img.save(img_byte_arr, format='PNG')
-        img_byte_arr.seek(0)
-        
-        ct = ColorThief(img_byte_arr)
-        dominant = ct.get_color(quality=1)
-        # Get palette of 5 colors for UI accents
-        palette = ct.get_palette(color_count=5, quality=1)
-        
-        # 4. Save & Cleanup
-        output_filename = f"{uuid.uuid4()}.png"
-        output_path = os.path.join('/tmp', output_filename)
-        final_img.save(output_path)
+    slide = prs.slides.add_slide(prs.slide_layouts[6]) # Blank layout
+    
+    for el in template['elements']:
+        val = str(user_data.get(el['name'].strip("{}"), el.get('placeholderText', '')))
+        if el['type'] == 'text':
+            txBox = slide.shapes.add_textbox(Inches(el['x']/96), Inches(el['y']/96), Inches(4), Inches(1))
+            tf = txBox.text_frame
+            tf.text = val
+    
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf
 
-        return jsonify({
-            "status": "success",
-            "file_id": output_filename,
-            "download_url": f"/download/{output_filename}",
-            "colors": {
-                "dominant": rgb_to_hex(dominant),
-                "palette": [rgb_to_hex(c) for c in palette]
-            }
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+# --- VIDEO GENERATION (MoviePy) ---
+def generate_video(image_stream, audio_url=None):
+    # Create a 5-second clip from the generated PNG
+    with Image.open(image_stream) as img:
+        img.save("/tmp/frame.png")
+    
+    clip = ImageClip("/tmp/frame.png").set_duration(5)
+    
+    if audio_url:
+        audio = AudioFileClip(audio_url)
+        clip = clip.set_audio(audio)
+    
+    output_path = "/tmp/promo.mp4"
+    # MoviePy uses the FFmpeg already on your Leapcell
+    clip.write_videofile(output_path, fps=24, codec="libx264")
+    return output_path
 
-@app.route('/download/<filename>', methods=['GET'])
-def download_file(filename):
-    path = os.path.join('/tmp', filename)
-    if os.path.exists(path):
-        return send_file(path, mimetype='image/png')
-    return jsonify({"error": "File expired or not found"}), 404
+@app.route('/export/<fmt>', methods=['POST'])
+def export_format(fmt):
+    user_data = request.json
+    template = get_json_template()
+
+    if fmt == 'pdf':
+        pdf_content = generate_pdf(user_data, template)
+        return Response(pdf_content, mimetype="application/pdf")
+    
+    elif fmt == 'pptx':
+        pptx_buf = generate_pptx(user_data, template)
+        return send_file(pptx_buf, as_attachment=True, download_name="poster.pptx")
+
+    elif fmt == 'video':
+        # 1. Generate PNG first
+        # (Reuse your existing PIL drawing logic here)
+        # 2. Convert to Video
+        video_path = generate_video("/tmp/last_generated.png", user_data.get('audio_url'))
+        return send_file(video_path, as_attachment=True)
+
+    return jsonify({"error": "Unsupported format"}), 400
 
 if __name__ == '__main__':
-    # Local dev only; Leapcell uses Gunicorn
     app.run(host='0.0.0.0', port=8080)
