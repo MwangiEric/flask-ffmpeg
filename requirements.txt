@@ -3,6 +3,7 @@ gunicorn
 pillow
 colorthief
 requests
-fpdf
+fpdf2
 python-pptx
-moviepy
+moviepy>=2.0.0
+decorator
