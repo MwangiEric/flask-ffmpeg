@@ -3,3 +3,6 @@ gunicorn
 pillow
 colorthief
 requests
+fpdf
+python-pptx
+moviepy
