@@ -1,2 +1,6 @@
 gunicorn
 flask
+rembg
+pillow
+colorthief
+onnxruntime
