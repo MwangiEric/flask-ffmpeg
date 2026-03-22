@@ -3,117 +3,133 @@ import io
 import json
 import base64
 import requests
-from flask import Flask, request, send_file, jsonify
+import traceback
+from flask import Flask, request, send_file, jsonify, Response
 
 # Core Engines
 from PIL import Image, ImageDraw, ImageFont
 from fpdf import FPDF
 from pptx import Presentation
-from pptx.util import Inches, Pt
-from moviepy.editor import ImageClip, AudioFileClip
+from pptx.util import Inches
+
+# MoviePy v2.0+ Modular Imports
+from moviepy.VideoClip import ImageClip
+from moviepy.audio.AudioClip import AudioFileClip
 
 app = Flask(__name__)
 
-# Paths
+# --- PATHS ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE_PATH = os.path.join(BASE_DIR, 'tk_port.json')
+# Note: Using the specific folder structure you requested
+TEMPLATE_PATH = os.path.join(BASE_DIR, 'templates', 'tk_port.json')
 POPPINS_PATH = os.path.join(BASE_DIR, 'assets', 'poppins.ttf')
 
-def get_font_path():
-    return POPPINS_PATH if os.path.exists(POPPINS_PATH) else None
+def get_font(size):
+    """Graceful font fallback: Poppins -> DejaVu -> Default"""
+    try:
+        return ImageFont.truetype(POPPINS_PATH, size=size)
+    except:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=size)
+        except:
+            return ImageFont.load_default()
 
-def get_json_template():
+def get_template():
     with open(TEMPLATE_PATH, 'r') as f:
         return json.load(f)
 
-# --- PDF GENERATION (FPDF) ---
-def generate_pdf(user_data, template):
-    pdf = FPDF(orientation='P', unit='pt', format=(1080, 1920))
-    pdf.add_page()
+# --- RENDERING ENGINE ---
+def draw_poster(user_data, template):
+    """Common logic to create the PIL Image object"""
+    bg_data = template['background']['base64']
+    if "base64," in bg_data:
+        bg_data = bg_data.split("base64,")[1]
     
-    # Draw Background (temporary file needed for FPDF)
-    bg_data = template['background']['base64'].split("base64,")[1]
-    bg_path = "/tmp/bg_temp.png"
-    with open(bg_path, "wb") as f:
-        f.write(base64.b64decode(bg_data))
-    pdf.image(bg_path, x=0, y=0, w=1080, h=1920)
-
-    # Add Poppins if available
-    font_p = get_font_path()
-    if font_p:
-        pdf.add_font('Poppins', '', font_p, uni=True)
-        pdf.set_font('Poppins', '', 40)
-    else:
-        pdf.set_font("Arial", size=40)
+    canvas = Image.open(io.BytesIO(base64.b64decode(bg_data))).convert("RGBA")
+    draw = ImageDraw.Draw(canvas)
 
     for el in template['elements']:
-        val = str(user_data.get(el['name'].strip("{}"), el.get('placeholderText', '')))
+        clean_key = el['name'].strip("{}")
+        value = str(user_data.get(clean_key, el.get('placeholderText', '')))
+
         if el['type'] == 'text':
-            pdf.text(el['x'], el['y'] + int(el['fontSize']), val)
-            
-    buf = io.BytesIO()
-    pdf.output(dest='S').encode('latin-1') # Return as string buffer
-    return pdf.output(dest='S')
+            font = get_font(int(el.get('fontSize', 40)))
+            draw.text((el['x'], el['y']), value, fill=el.get('fill', '#FFFFFF'), font=font)
 
-# --- PPTX GENERATION (python-pptx) ---
-def generate_pptx(user_data, template):
-    prs = Presentation()
-    # Set slide size to 1080x1920 (in pixels to inches conversion)
-    prs.slide_width = Inches(11.25) 
-    prs.slide_height = Inches(20)
+        elif el['type'] == 'image':
+            img_url = user_data.get(clean_key)
+            if img_url:
+                resp = requests.get(img_url, timeout=10)
+                overlay = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                overlay = overlay.resize((int(el['width']), int(el['height'])), Image.LANCZOS)
+                canvas.paste(overlay, (int(el['x']), int(el['y'])), overlay)
     
-    slide = prs.slides.add_slide(prs.slide_layouts[6]) # Blank layout
-    
-    for el in template['elements']:
-        val = str(user_data.get(el['name'].strip("{}"), el.get('placeholderText', '')))
-        if el['type'] == 'text':
-            txBox = slide.shapes.add_textbox(Inches(el['x']/96), Inches(el['y']/96), Inches(4), Inches(1))
-            tf = txBox.text_frame
-            tf.text = val
-    
-    buf = io.BytesIO()
-    prs.save(buf)
-    buf.seek(0)
-    return buf
+    return canvas
 
-# --- VIDEO GENERATION (MoviePy) ---
-def generate_video(image_stream, audio_url=None):
-    # Create a 5-second clip from the generated PNG
-    with Image.open(image_stream) as img:
-        img.save("/tmp/frame.png")
-    
-    clip = ImageClip("/tmp/frame.png").set_duration(5)
-    
-    if audio_url:
-        audio = AudioFileClip(audio_url)
-        clip = clip.set_audio(audio)
-    
-    output_path = "/tmp/promo.mp4"
-    # MoviePy uses the FFmpeg already on your Leapcell
-    clip.write_videofile(output_path, fps=24, codec="libx264")
-    return output_path
+# --- ROUTES ---
 
-@app.route('/export/<fmt>', methods=['POST'])
-def export_format(fmt):
-    user_data = request.json
-    template = get_json_template()
+@app.route('/export/png', methods=['POST'])
+def export_png():
+    try:
+        template = get_template()
+        canvas = draw_poster(request.json, template)
+        buf = io.BytesIO()
+        canvas.save(buf, format='PNG')
+        buf.seek(0)
+        return send_file(buf, mimetype='image/png')
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if fmt == 'pdf':
-        pdf_content = generate_pdf(user_data, template)
-        return Response(pdf_content, mimetype="application/pdf")
-    
-    elif fmt == 'pptx':
-        pptx_buf = generate_pptx(user_data, template)
-        return send_file(pptx_buf, as_attachment=True, download_name="poster.pptx")
+@app.route('/export/pdf', methods=['POST'])
+def export_pdf():
+    try:
+        template = get_template()
+        user_data = request.json
+        
+        pdf = FPDF(orientation='P', unit='pt', format=(1080, 1920))
+        pdf.add_page()
+        
+        # Save temp BG for FPDF
+        bg_path = "/tmp/temp_bg.png"
+        canvas = draw_poster(user_data, template)
+        canvas.save(bg_path)
+        pdf.image(bg_path, x=0, y=0, w=1080, h=1920)
 
-    elif fmt == 'video':
-        # 1. Generate PNG first
-        # (Reuse your existing PIL drawing logic here)
-        # 2. Convert to Video
-        video_path = generate_video("/tmp/last_generated.png", user_data.get('audio_url'))
-        return send_file(video_path, as_attachment=True)
+        return Response(pdf.output(), mimetype="application/pdf")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    return jsonify({"error": "Unsupported format"}), 400
+@app.route('/export/video', methods=['POST'])
+def export_video():
+    clip = None
+    try:
+        template = get_template()
+        user_data = request.json
+        
+        # 1. Generate the Frame
+        frame_path = "/tmp/video_frame.png"
+        canvas = draw_poster(user_data, template)
+        canvas.save(frame_path)
+
+        # 2. MoviePy v2.0 logic
+        clip = ImageClip(frame_path).with_duration(5)
+        
+        audio_url = user_data.get('audio_url')
+        if audio_url:
+            audio_resp = requests.get(audio_url)
+            with open("/tmp/temp_audio.mp3", "wb") as f:
+                f.write(audio_resp.content)
+            audio = AudioFileClip("/tmp/temp_audio.mp3")
+            clip = clip.with_audio(audio)
+
+        out_path = "/tmp/export_video.mp4"
+        clip.write_videofile(out_path, fps=24, codec="libx264", audio_codec="aac")
+        
+        return send_file(out_path, as_attachment=True)
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+    finally:
+        if clip: clip.close()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
