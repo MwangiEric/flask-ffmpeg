@@ -1,6 +1,5 @@
-gunicorn
 flask
-rembg
+gunicorn
 pillow
 colorthief
-onnxruntime
+requests
